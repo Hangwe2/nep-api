@@ -157,12 +157,29 @@ app.get('/api/members', auth, async (req, res) => {
 });
 
 app.post('/api/members', auth, async (req, res) => {
-  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries } = req.body;
+  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries, manual_member_no } = req.body;
   if (!first_name || !last_name) return res.status(400).json({ error: 'Name required' });
   try {
-    const cnt = await pool.query('SELECT COUNT(*) FROM members');
-    const num = String(parseInt(cnt.rows[0].count) + 1).padStart(3, '0');
-    const member_no = 'NEP-' + num;
+    let member_no;
+    if (manual_member_no && manual_member_no.trim()) {
+      // Use provided policy number
+      member_no = manual_member_no.trim().toUpperCase();
+      const dup = await pool.query('SELECT id FROM members WHERE member_no=$1', [member_no]);
+      if (dup.rows.length > 0) {
+        return res.status(400).json({ error: 'Policy number ' + member_no + ' already exists.' });
+      }
+    } else {
+      // Auto-generate from highest existing number
+      const last = await pool.query(
+        "SELECT member_no FROM members WHERE member_no ~ '^NEP-[0-9]+$' ORDER BY LENGTH(member_no) DESC, member_no DESC LIMIT 1"
+      );
+      if (last.rows.length > 0) {
+        const lastNum = parseInt(last.rows[0].member_no.replace('NEP-','')) + 1;
+        member_no = 'NEP-' + String(lastNum).padStart(3, '0');
+      } else {
+        member_no = 'NEP-001';
+      }
+    }
 
     const r = await pool.query(
       `INSERT INTO members (member_no, first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries)
