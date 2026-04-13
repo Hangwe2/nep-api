@@ -277,6 +277,27 @@ app.post('/api/payments', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
+// ── Edit payment (Owner only) ─────────────────────────────────────
+app.put('/api/payments/:id', auth, async (req, res) => {
+  const { amount, reference, channel, date } = req.body;
+  try {
+    const r = await pool.query(
+      'UPDATE payments SET amount=$1, reference=$2, channel=$3, date=$4 WHERE id=$5 RETURNING *',
+      [amount, reference||'', channel||'', date||'', req.params.id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+    // Update member last_pay if needed
+    if (date && r.rows[0].member_id) {
+      await pool.query(
+        'UPDATE members SET last_pay=$1 WHERE id=$2',
+        [date, r.rows[0].member_id]
+      );
+    }
+    await logActivity(req.user.id, req.user.fn+' '+req.user.ln, 'Payment Edited', 'Payment #'+req.params.id+' updated to R'+amount, 'warning', pool);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══════════════════════════════════════════════════════════════════
 // TASKS
 // ══════════════════════════════════════════════════════════════════
