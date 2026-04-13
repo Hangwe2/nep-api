@@ -17,9 +17,47 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// ── Rate limiter (in-memory) ──────────────────────────────────────
+// Blocks brute-force password guessing: 5 failed attempts = 15 min lockout
+const loginAttempts = {};
+const MAX_ATTEMPTS  = 5;
+const LOCKOUT_MS    = 15 * 60 * 1000;
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  if (!loginAttempts[ip]) {
+    loginAttempts[ip] = { count: 0, firstAttempt: now, locked: false };
+  }
+  const rec = loginAttempts[ip];
+  if (rec.locked && (now - rec.firstAttempt) > LOCKOUT_MS) {
+    loginAttempts[ip] = { count: 0, firstAttempt: now, locked: false };
+    return false;
+  }
+  if (rec.locked) return true;
+  if ((now - rec.firstAttempt) > LOCKOUT_MS) {
+    loginAttempts[ip] = { count: 1, firstAttempt: now, locked: false };
+    return false;
+  }
+  rec.count++;
+  if (rec.count >= MAX_ATTEMPTS) rec.locked = true;
+  return rec.locked;
+}
+
+function clearRateLimit(ip) {
+  delete loginAttempts[ip];
+}
+
 // ── Middleware ────────────────────────────────────────────────────
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
 
 // ── Auth middleware ───────────────────────────────────────────────
 function auth(req, res, next) {
@@ -32,6 +70,14 @@ function auth(req, res, next) {
   } catch(e) {
     return res.status(401).json({ error: 'Invalid token' });
   }
+}
+
+// Owner-only middleware
+function ownerOnly(req, res, next) {
+  if (!req.user || req.user.role !== 'Owner') {
+    return res.status(403).json({ error: 'Owner access required' });
+  }
+  next();
 }
 
 // ── Health ────────────────────────────────────────────────────────
@@ -48,7 +94,14 @@ app.get('/health', async (req, res) => {
 // AUTH
 // ══════════════════════════════════════════════════════════════════
 app.post('/api/auth/login', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const { username, password } = req.body;
+
+  // Rate limit check
+  if (checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many login attempts. Please wait 15 minutes.' });
+  }
+
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
   try {
@@ -66,9 +119,13 @@ app.post('/api/auth/login', async (req, res) => {
     } else {
       valid = (user.password_hash === password);
     }
+
     if (!valid) return res.json({ error: 'Incorrect password.' });
     if (user.status === 'pending')   return res.json({ pending: true });
     if (user.status === 'suspended') return res.json({ error: 'Account suspended. Contact owner.' });
+
+    // Clear rate limit on successful login
+    clearRateLimit(ip);
 
     // Update last login
     await pool.query(
@@ -81,7 +138,7 @@ app.post('/api/auth/login', async (req, res) => {
       username: user.username, role: user.role, branch: user.branch,
       permissions: user.permissions, status: user.status
     };
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
     res.json({ token, user: payload });
   } catch(e) {
     console.error(e);
@@ -101,8 +158,8 @@ app.get('/api/members', auth, async (req, res) => {
 
 app.post('/api/members', auth, async (req, res) => {
   const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries } = req.body;
+  if (!first_name || !last_name) return res.status(400).json({ error: 'Name required' });
   try {
-    // Generate member_no
     const cnt = await pool.query('SELECT COUNT(*) FROM members');
     const num = String(parseInt(cnt.rows[0].count) + 1).padStart(3, '0');
     const member_no = 'NEP-' + num;
@@ -113,9 +170,7 @@ app.post('/api/members', auth, async (req, res) => {
       [member_no, first_name, last_name, id_number||'', phone||'', email||'', village||'', plan||'', branch||'', amount||0, status||'Active', JSON.stringify(beneficiaries||[])]
     );
 
-    // Log activity
     await logActivity(req.user.id, req.user.fn+' '+req.user.ln, 'Add Member', 'Added '+first_name+' '+last_name+' ('+member_no+')', 'info', pool);
-
     res.json(r.rows[0]);
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
@@ -168,7 +223,6 @@ app.post('/api/claims', auth, async (req, res) => {
     const claim_no = 'CLM-' + num;
     const today = new Date().toLocaleDateString('en-ZA', {day:'2-digit',month:'short',year:'numeric'});
 
-    // Get member info
     let member_name = '', plan = '';
     if (member_id) {
       const m = await pool.query('SELECT first_name, last_name, plan FROM members WHERE id=$1', [member_id]);
@@ -204,14 +258,12 @@ app.get('/api/payments', auth, async (req, res) => {
 app.post('/api/payments', auth, async (req, res) => {
   const { member_id, amount, reference, date, channel } = req.body;
   try {
-    // Get member info
     let member_name = '', plan = '';
     if (member_id) {
       const m = await pool.query('SELECT first_name, last_name, plan, status FROM members WHERE id=$1', [member_id]);
       if (m.rows[0]) {
         member_name = m.rows[0].first_name + ' ' + m.rows[0].last_name;
         plan = m.rows[0].plan;
-        // Update last_pay and activate if pending
         const newStatus = m.rows[0].status === 'Pending' ? 'Active' : m.rows[0].status;
         await pool.query('UPDATE members SET last_pay=$1, status=$2 WHERE id=$3', [date, newStatus, member_id]);
       }
@@ -322,7 +374,6 @@ app.post('/api/funerals', auth, async (req, res) => {
        JSON.stringify(budget_lines||[]), budget_total||0]
     );
 
-    // Record income in ledger
     const today = new Date().toLocaleDateString('en-ZA', {day:'2-digit',month:'short',year:'numeric'});
     await pool.query(
       'INSERT INTO funeral_ledger (funeral_id, type, description, amount, date, recorded_by, recorded_by_name) VALUES ($1,$2,$3,$4,$5,$6,$7)',
@@ -365,22 +416,26 @@ app.get('/api/funerals/:id/ledger', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
-// STAFF
+// STAFF — Owner only for sensitive operations
 // ══════════════════════════════════════════════════════════════════
 app.get('/api/staff', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM staff ORDER BY id ASC');
+    // Return staff without password hashes
+    const r = await pool.query(
+      'SELECT id, first_name, last_name, username, email, phone, role, branch, permissions, status, joined_at, last_login, login_count FROM staff ORDER BY id ASC'
+    );
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/staff', auth, async (req, res) => {
+app.post('/api/staff', auth, ownerOnly, async (req, res) => {
   const { fn, ln, username, password, email, phone, role, branch, permissions } = req.body;
+  if (!fn || !ln || !username || !password) return res.status(400).json({ error: 'Required fields missing' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const r = await pool.query(
       `INSERT INTO staff (first_name, last_name, username, password_hash, email, phone, role, branch, permissions, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING id, first_name, last_name, username, email, phone, role, branch, permissions, status, joined_at`,
       [fn, ln, username.toLowerCase(), hash, email||'', phone||'', role||'Agent', branch||'', JSON.stringify(permissions||[])]
     );
     await logActivity(req.user.id, req.user.fn+' '+req.user.ln, 'Staff Created', fn+' '+ln+' ('+role+')', 'info', pool);
@@ -391,16 +446,16 @@ app.post('/api/staff', auth, async (req, res) => {
   }
 });
 
-app.put('/api/staff/:id', auth, async (req, res) => {
+app.put('/api/staff/:id', auth, ownerOnly, async (req, res) => {
   const { fn, ln, username, password, email, phone, role, branch, permissions, status } = req.body;
   try {
     let query, params;
     if (password && password.length >= 4) {
       const hash = await bcrypt.hash(password, 10);
-      query = 'UPDATE staff SET first_name=$1, last_name=$2, username=$3, password_hash=$4, email=$5, phone=$6, role=$7, branch=$8, permissions=$9, status=$10 WHERE id=$11 RETURNING *';
+      query = 'UPDATE staff SET first_name=$1, last_name=$2, username=$3, password_hash=$4, email=$5, phone=$6, role=$7, branch=$8, permissions=$9, status=$10 WHERE id=$11 RETURNING id, first_name, last_name, username, email, role, branch, status';
       params = [fn, ln, username.toLowerCase(), hash, email||'', phone||'', role||'Agent', branch||'', JSON.stringify(permissions||[]), status||'active', req.params.id];
     } else {
-      query = 'UPDATE staff SET first_name=$1, last_name=$2, username=$3, email=$4, phone=$5, role=$6, branch=$7, permissions=$8, status=$9 WHERE id=$10 RETURNING *';
+      query = 'UPDATE staff SET first_name=$1, last_name=$2, username=$3, email=$4, phone=$5, role=$6, branch=$7, permissions=$8, status=$9 WHERE id=$10 RETURNING id, first_name, last_name, username, email, role, branch, status';
       params = [fn, ln, username.toLowerCase(), email||'', phone||'', role||'Agent', branch||'', JSON.stringify(permissions||[]), status||'active', req.params.id];
     }
     const r = await pool.query(query, params);
@@ -408,7 +463,7 @@ app.put('/api/staff/:id', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/staff/activity', auth, async (req, res) => {
+app.get('/api/staff/activity', auth, ownerOnly, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM activity_log ORDER BY id DESC LIMIT 200');
     res.json(r.rows);
@@ -424,6 +479,11 @@ async function logActivity(staff_id, user_name, action, detail, level, pool) {
     );
   } catch(e) { /* non-critical */ }
 }
+
+// ── 404 handler ───────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
 // ── Start ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
