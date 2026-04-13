@@ -193,23 +193,23 @@ app.post('/api/members', auth, async (req, res) => {
 });
 
 app.put('/api/members/:id', auth, async (req, res) => {
-  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries } = req.body;
+  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries, paid_ahead } = req.body;
   try {
     const r = await pool.query(
-      `UPDATE members SET first_name=$1, last_name=$2, id_number=$3, phone=$4, email=$5, village=$6, plan=$7, branch=$8, amount=$9, status=$10, beneficiaries=$11
-       WHERE id=$12 RETURNING *`,
-      [first_name, last_name, id_number||'', phone||'', email||'', village||'', plan||'', branch||'', amount||0, status||'Active', JSON.stringify(beneficiaries||[]), req.params.id]
+      `UPDATE members SET first_name=$1, last_name=$2, id_number=$3, phone=$4, email=$5, village=$6, plan=$7, branch=$8, amount=$9, status=$10, beneficiaries=$11, paid_ahead=COALESCE($12, paid_ahead)
+       WHERE id=$13 RETURNING *`,
+      [first_name, last_name, id_number||'', phone||'', email||'', village||'', plan||'', branch||'', amount||0, status||'Active', JSON.stringify(beneficiaries||[]), paid_ahead||null, req.params.id]
     );
     res.json(r.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/members/:id/pay', auth, async (req, res) => {
-  const { last_pay, status } = req.body;
+  const { last_pay, status, paid_ahead } = req.body;
   try {
     const r = await pool.query(
-      'UPDATE members SET last_pay=$1, status=$2 WHERE id=$3 RETURNING *',
-      [last_pay, status, req.params.id]
+      'UPDATE members SET last_pay=$1, status=$2, paid_ahead=COALESCE($3, paid_ahead) WHERE id=$4 RETURNING *',
+      [last_pay, status, paid_ahead != null ? paid_ahead : null, req.params.id]
     );
     res.json(r.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -277,17 +277,19 @@ app.post('/api/payments', auth, async (req, res) => {
   try {
     let member_name = '', plan = '';
     if (member_id) {
-      const m = await pool.query('SELECT first_name, last_name, plan, status FROM members WHERE id=$1', [member_id]);
+      const m = await pool.query('SELECT first_name, last_name, plan, branch, status FROM members WHERE id=$1', [member_id]);
       if (m.rows[0]) {
         member_name = m.rows[0].first_name + ' ' + m.rows[0].last_name;
         plan = m.rows[0].plan;
+        member_branch = m.rows[0].branch || '';
         const newStatus = m.rows[0].status === 'Pending' ? 'Active' : m.rows[0].status;
         await pool.query('UPDATE members SET last_pay=$1, status=$2 WHERE id=$3', [date, newStatus, member_id]);
       }
     }
     const r = await pool.query(
-      'INSERT INTO payments (member_id, member_name, plan, amount, reference, date, channel, recorded_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [member_id||null, member_name, plan, amount, reference||'', date||'', channel||'', req.user.id]
+      `INSERT INTO payments (member_id, member_name, plan, amount, reference, date, channel, branch, recorded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [member_id||null, member_name, plan, amount, reference||'', date||'', channel||'', member_branch, req.user.id]
     );
     await logActivity(req.user.id, req.user.fn+' '+req.user.ln, 'Payment', 'Recorded R'+amount+' for '+member_name, 'info', pool);
     res.json(r.rows[0]);
