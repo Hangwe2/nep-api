@@ -193,12 +193,14 @@ app.post('/api/members', auth, async (req, res) => {
 });
 
 app.put('/api/members/:id', auth, async (req, res) => {
-  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries, paid_ahead } = req.body;
+  const { first_name, last_name, id_number, phone, email, village, plan, branch, amount, status, beneficiaries, paid_ahead, pay_score, overdue_count } = req.body;
   try {
     const r = await pool.query(
-      `UPDATE members SET first_name=$1, last_name=$2, id_number=$3, phone=$4, email=$5, village=$6, plan=$7, branch=$8, amount=$9, status=$10, beneficiaries=$11, paid_ahead=COALESCE($12, paid_ahead)
-       WHERE id=$13 RETURNING *`,
-      [first_name, last_name, id_number||'', phone||'', email||'', village||'', plan||'', branch||'', amount||0, status||'Active', JSON.stringify(beneficiaries||[]), paid_ahead||null, req.params.id]
+      `UPDATE members SET first_name=$1, last_name=$2, id_number=$3, phone=$4, email=$5, village=$6, plan=$7, branch=$8, amount=$9, status=$10, beneficiaries=$11,
+       paid_ahead=COALESCE($12, paid_ahead), pay_score=COALESCE($13, pay_score), overdue_count=COALESCE($14, overdue_count)
+       WHERE id=$15 RETURNING *`,
+      [first_name, last_name, id_number||'', phone||'', email||'', village||'', plan||'', branch||'', amount||0, status||'Active', JSON.stringify(beneficiaries||[]),
+       paid_ahead||null, pay_score||null, overdue_count||null, req.params.id]
     );
     res.json(r.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -233,7 +235,7 @@ app.get('/api/claims', auth, async (req, res) => {
 });
 
 app.post('/api/claims', auth, async (req, res) => {
-  const { member_id, type, notes } = req.body;
+  const { member_id, type, notes, amount } = req.body;
   try {
     const cnt = await pool.query('SELECT COUNT(*) FROM claims');
     const num = String(parseInt(cnt.rows[0].count) + 25).padStart(3, '0');
@@ -247,8 +249,8 @@ app.post('/api/claims', auth, async (req, res) => {
     }
 
     const r = await pool.query(
-      'INSERT INTO claims (claim_no, member_id, member_name, plan, type, notes, status, date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [claim_no, member_id||null, member_name, plan, type||'', notes||'', 'Pending', today]
+      'INSERT INTO claims (claim_no, member_id, member_name, plan, type, notes, amount, status, date) VALUES ($1,$2,$3,$4,$5,$6,$7,\'Pending\',$8) RETURNING *',
+      [claim_no, member_id||null, member_name, plan, type||'', notes||'', amount||0, today]
     );
     res.json(r.rows[0]);
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
@@ -267,7 +269,13 @@ app.put('/api/claims/:id', auth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 app.get('/api/payments', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM payments ORDER BY id DESC');
+    const r = await pool.query(`
+      SELECT p.*,
+             s.first_name || ' ' || s.last_name AS recorded_by_name
+      FROM payments p
+      LEFT JOIN staff s ON s.id = p.recorded_by
+      ORDER BY p.id DESC
+    `);
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
